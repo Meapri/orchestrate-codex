@@ -1,0 +1,186 @@
+"""MCP stdio server for supervised orchestration."""
+
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any, Callable, Dict, List
+
+from . import __version__, policy, recipes
+
+SERVER_NAME = "orchestrate-codex"
+SERVER_VERSION = __version__
+DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+LEGACY_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+
+
+class RpcError(ValueError):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _empty() -> Dict[str, Any]:
+    return {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+def tool_definitions() -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": "orchestrate_list_recipes",
+            "description": "List built-in supervised orchestration recipes.",
+            "inputSchema": _empty(),
+        },
+        {
+            "name": "orchestrate_explain_recipe",
+            "description": "Explain a recipe: stages, doc_class, context policy, default leaf bindings.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"recipe_id": {"type": "string"}},
+                "required": ["recipe_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "orchestrate_plan_recipe",
+            "description": (
+                "Build a supervised execution plan for a recipe. Returns ordered steps with "
+                "suggested leaf MCP tool names. Codex should call those tools; this server does "
+                "not invoke other MCP servers in v0.1."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "recipe_id": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "model": {"type": "string"},
+                    "system": {"type": "string"},
+                    "bindings": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Override capability→tool map, e.g. {\"chat\": \"grok_codex_chat\"}",
+                    },
+                },
+                "required": ["recipe_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "orchestrate_context_policy",
+            "description": "Return context policy for a doc_class (durable|change|transform|direct).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "doc_class": {
+                        "type": "string",
+                        "enum": sorted(policy.DOC_CLASSES.keys()),
+                    }
+                },
+                "required": ["doc_class"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def _ok(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "success": True,
+        "provider": "orchestrate",
+        "backend": "supervised-local",
+        "warnings": [],
+        "text": json.dumps(payload, ensure_ascii=False, indent=2),
+        **payload,
+    }
+
+
+def dispatch_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if name == "orchestrate_list_recipes":
+            return _ok({"recipes": recipes.list_recipes()})
+        if name == "orchestrate_explain_recipe":
+            return _ok(recipes.explain_recipe(str(arguments.get("recipe_id") or "")))
+        if name == "orchestrate_plan_recipe":
+            rid = str(arguments.get("recipe_id") or "")
+            bindings = arguments.get("bindings") if isinstance(arguments.get("bindings"), dict) else None
+            args = {
+                k: arguments.get(k)
+                for k in ("prompt", "instruction", "model", "system")
+                if arguments.get(k)
+            }
+            return _ok(recipes.plan_recipe(rid, args=args, bindings=bindings))
+        if name == "orchestrate_context_policy":
+            return _ok(policy.get_policy(str(arguments.get("doc_class") or "")))
+        raise ValueError(f"unknown tool: {name}")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "provider": "orchestrate",
+            "backend": "supervised-local",
+            "text": str(exc),
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "warnings": [],
+        }
+
+
+def handle_request(message: Dict[str, Any]) -> Dict[str, Any] | None:
+    request_id = message.get("id")
+    if request_id is None:
+        return None
+    method = message.get("method")
+    try:
+        if method == "initialize":
+            params = message.get("params") or {}
+            requested = str(params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION)
+            selected = requested if requested in LEGACY_PROTOCOL_VERSIONS else DEFAULT_PROTOCOL_VERSION
+            result = {
+                "protocolVersion": selected,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            }
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": tool_definitions()}
+        elif method == "tools/call":
+            params = message.get("params") or {}
+            name = str(params.get("name") or "")
+            arguments = params.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                raise RpcError(-32602, "tool arguments must be an object")
+            if name not in {t["name"] for t in tool_definitions()}:
+                raise RpcError(-32602, f"unknown tool: {name}")
+            result = dispatch_tool(name, arguments)
+        else:
+            raise RpcError(-32601, f"unsupported method: {method}")
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+    except RpcError as exc:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": str(exc)}}
+    except Exception as exc:  # noqa: BLE001
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+
+
+def serve() -> int:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(message, dict):
+            continue
+        if message.get("id") is None and message.get("method"):
+            continue
+        response = handle_request(message)
+        if response is not None:
+            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(serve())
