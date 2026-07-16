@@ -26,6 +26,9 @@ FALLBACK_CHAINS: Dict[str, List[str]] = {
 # Max concurrently-retained runs; oldest evicted first (in-process store only).
 MAX_RUNS = 200
 
+# Default output budget for a structured write (README/PR/etc.); leaf defaults truncate.
+DEFAULT_WRITE_MAX_TOKENS = 8192
+
 _RUNS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -167,6 +170,12 @@ def _enrich_write_args(
     for key in recipes.WRITE_PASSTHROUGH:
         if user_args.get(key) not in (None, ""):
             args[key] = user_args[key]
+    # Give the writer enough room for a full structured document — the leaf's default
+    # is small and silently truncated long READMEs mid-section. Caller can override.
+    if user_args.get("max_tokens"):
+        args["max_tokens"] = int(user_args["max_tokens"])
+    else:
+        args["max_tokens"] = DEFAULT_WRITE_MAX_TOKENS
     model = _stage_model(step, user_args)  # per-stage override wins over global
     if model:
         args["model"] = model

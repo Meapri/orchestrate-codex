@@ -51,9 +51,10 @@ def verify_text(
             # unknown means claimed not in detected list
             for t in unknown:
                 warnings.append(f"tool_not_in_fact_pack:{t}")
-    ok = not any(w.startswith("empty") for w in warnings)
+    warnings.extend(_completeness_warnings(body))
+    blocking = ("empty", "recency", "unclosed_code_fence", "truncated")
     return {
-        "ok": ok and len([w for w in warnings if w.startswith("recency")]) == 0,
+        "ok": not any(w.startswith(blocking) for w in warnings),
         "warnings": warnings,
         "warning_count": len(warnings),
         "text": (
@@ -62,3 +63,31 @@ def verify_text(
             else "verify warnings:\n" + "\n".join(f"- {w}" for w in warnings)
         ),
     }
+
+
+def _completeness_warnings(body: str) -> List[str]:
+    """Detect a document that was cut off mid-generation (e.g. the leaf hit max_tokens).
+
+    verify used to pass a truncated README as clean because it only checked tone/tools.
+    """
+    out: List[str] = []
+    text = body.strip()
+    # Only meaningful for real documents; skip short snippets to avoid false positives.
+    if len(text) < 200:
+        return out
+    if text.count("```") % 2 == 1:
+        out.append("unclosed_code_fence")
+    terminal = ".!?:)]`\"'”』」…"
+    # A trailing heading with no body, or a short unpunctuated fragment under it = cut section.
+    headings = [m.start() for m in re.finditer(r"(?m)^#{1,6}\s", text)]
+    if headings:
+        nl = text.find("\n", headings[-1])
+        after = text[nl + 1:].strip() if nl != -1 else ""
+        if not after or (len(after) < 25 and after[-1] not in terminal):
+            out.append("truncated_trailing_section")
+    # Ends mid-sentence: last non-empty line isn't closed by punctuation / table / list / fence.
+    last = text.splitlines()[-1].strip()
+    if last and "|" not in last and not last.startswith(("#", "-", "*", ">", "```")):
+        if last[-1] not in terminal:
+            out.append("truncated_midsentence")
+    return out

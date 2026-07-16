@@ -230,6 +230,33 @@ def test_verify_allows_cli_commands(tmp_path):
     assert any("grok_codex_teleport" in w for w in bad["warnings"])
 
 
+def test_verify_flags_truncated_document():
+    # a long doc cut off after a heading (leaf hit max_tokens) must not pass as clean
+    body = "# Title\n\n## 개요\n" + "This section has real content. " * 12 + "\n\n## 아키텍처\n\nGrok"
+    r = verify.verify_text(body, doc_class="durable")
+    assert r["ok"] is False
+    assert any(w.startswith("truncated") for w in r["warnings"])
+    # a properly closed doc of the same size passes
+    ok_body = "# Title\n\n## 개요\n" + "This section has real content. " * 12 + "\n\n## 라이선스\nReleased under the MIT license."
+    assert verify.verify_text(ok_body, doc_class="durable")["ok"] is True
+
+
+def test_verify_flags_unclosed_code_fence():
+    body = "# T\n\n" + "x" * 220 + "\n\n```bash\npip install -e ."  # fence never closed
+    r = verify.verify_text(body, doc_class="durable")
+    assert "unclosed_code_fence" in r["warnings"] and r["ok"] is False
+
+
+def test_write_step_sets_max_tokens_budget():
+    out = dispatch_tool("orchestrate_step", {"capability": "write", "write_task": "readme",
+                                             "instruction": "x", "doc_class": "durable", "project_root": "."})
+    assert out["arguments"]["max_tokens"] == runner.DEFAULT_WRITE_MAX_TOKENS
+    # caller can override
+    out2 = dispatch_tool("orchestrate_step", {"capability": "write", "write_task": "readme",
+                                              "instruction": "x", "extra_args": {"max_tokens": 2000}})
+    assert out2["arguments"]["max_tokens"] == 2000
+
+
 def test_change_doc_recency_not_flagged():
     result = verify.verify_text("today we fixed the parser", doc_class="change")
     assert not any("recency" in w for w in result["warnings"])
