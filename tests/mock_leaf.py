@@ -45,6 +45,9 @@ def main() -> int:
             args = (req.get("params") or {}).get("arguments") or {}
             if fail:
                 result = {"content": [{"type": "text", "text": msg}], "isError": True}
+            elif os.environ.get("MOCK_LEAF_SOFT") == "1":
+                # a backend error handed back as "successful" text (e.g. Grok HTTP 503)
+                result = {"content": [{"type": "text", "text": msg}], "isError": False}
             else:
                 text = f"MOCK[{tool}] " + json.dumps(args, ensure_ascii=False)
                 result = {"content": [{"type": "text", "text": text}], "isError": False}

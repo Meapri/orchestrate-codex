@@ -144,6 +144,9 @@ def gather_durable_facts(project_root: str | Path = ".") -> Dict[str, Any]:
     tools = _mcp_tools_from_config(root)
     cli_commands = _cli_commands_from_tree(root)
     install_commands = _install_commands(root)
+    packages = sorted(
+        d.name for d in root.iterdir() if d.is_dir() and (d / "__init__.py").is_file()
+    )
     skills = _list_skills(root)
     has_license = (root / "LICENSE").is_file() or (root / "LICENSE.md").is_file()
     readme = root / "README.md"
@@ -159,6 +162,7 @@ def gather_durable_facts(project_root: str | Path = ".") -> Dict[str, Any]:
         "mcp_tools_detected": tools,
         "cli_commands": cli_commands,
         "install_commands": install_commands,
+        "packages": packages,
         "has_license": has_license,
         "install_hints": install_commands or [
             f'codex plugin marketplace add "{root}"',

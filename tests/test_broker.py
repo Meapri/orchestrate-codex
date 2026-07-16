@@ -59,6 +59,24 @@ def test_broker_rotates_on_leaf_failure(tmp_path):
     assert "MOCK[claude_codex_chat]" in out["artifact"]
 
 
+def test_broker_treats_soft_error_as_failure(tmp_path):
+    # Grok hands back an HTTP 503 as "successful" text; broker must rotate to the fallback
+    # instead of using the error string as the answer.
+    reg = {
+        "grok_codex_chat": {"command": sys.executable, "args": [_MOCK],
+                            "env": {"MOCK_LEAF_TOOL": "grok_codex_chat", "MOCK_LEAF_SOFT": "1",
+                                    "MOCK_LEAF_MSG": "HTTP 503: upstream connect error, connection refused"}},
+        "claude_codex_chat": {"command": sys.executable, "args": [_MOCK],
+                              "env": {"MOCK_LEAF_TOOL": "claude_codex_chat"}},
+    }
+    out = broker.run_auto("direct_chat", args={"prompt": "hi"}, project_root=str(tmp_path),
+                          bindings={"chat": "grok_codex_chat"}, leaves=reg)
+    tools = [t["tool"] for t in out["trace"]]
+    assert "grok_codex_chat" in tools  # tried grok
+    assert any(t.get("soft_error") for t in out["trace"])  # detected the 503
+    assert out["ok"] is True and "MOCK[claude_codex_chat]" in out["artifact"]  # rotated + succeeded
+
+
 def test_broker_no_leaves_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("ORCHESTRATE_CODEX_LEAVES", str(tmp_path / "nope.json"))
     out = broker.run_auto("direct_chat", args={"prompt": "hi"}, project_root=str(tmp_path))

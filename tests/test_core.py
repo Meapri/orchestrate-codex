@@ -41,6 +41,16 @@ def test_step_write_synthesis_uses_findings_as_source(tmp_path):
     assert "prompt" not in out["arguments"]  # write schema shape
 
 
+def test_cross_provider_fallback_fixes_model():
+    # regression: a model carried across a provider fallback (grok-4.5 -> a Gemini/Claude
+    # leaf) 404s. The selected tool's provider model must be substituted.
+    step = {"id": "s", "capability": "chat", "instruction": "x"}
+    ua = {"prompt": "hi", "model": "grok-4.5"}
+    assert runner._args_for_tool(step, "grok_codex_chat", user_args=ua, pol={"doc_class": "direct"}, artifacts={})["model"] == "grok-4.5"
+    assert runner._args_for_tool(step, "claude_codex_chat", user_args=ua, pol={"doc_class": "direct"}, artifacts={})["model"] == "claude-opus-4-8"
+    assert runner._args_for_tool(step, "google_antigravity_chat", user_args=ua, pol={"doc_class": "direct"}, artifacts={})["model"] == "gemini-3.1-pro-high"
+
+
 def test_step_can_force_leaf_and_model():
     out = dispatch_tool("orchestrate_step", {
         "capability": "chat", "instruction": "x", "leaf": "grok_codex_chat", "model": "grok-4.5",
@@ -97,6 +107,18 @@ def test_run_survives_process_restart(tmp_path):
     # and it can still be continued
     done = runner.continue_run(run_id=rid, stage_id="chat", result_text="ok", success=True)
     assert done["status"] == "completed"
+
+
+def test_looks_like_leaf_error():
+    err = "HTTP 503: upstream connect error or disconnect/reset before headers. Connection refused"
+    assert errors.looks_like_leaf_error(err) is True
+    assert errors.classify(err) == "transient"  # -> rotatable
+    # a long real document that merely mentions an error code is NOT flagged
+    doc = "# README\n\n" + ("This tool handles HTTP 500 responses gracefully. " * 40)
+    assert errors.looks_like_leaf_error(doc) is False
+    assert errors.looks_like_leaf_error("") is False
+    # 4xx backend errors handed back as text are also leaf failures (regression: 404 missed)
+    assert errors.looks_like_leaf_error("Antigravity Code Assist returned HTTP 404; response body omitted.") is True
 
 
 def test_error_classification_and_no_rotate_on_bad_request(tmp_path):
@@ -255,6 +277,40 @@ def test_write_step_sets_max_tokens_budget():
     out2 = dispatch_tool("orchestrate_step", {"capability": "write", "write_task": "readme",
                                               "instruction": "x", "extra_args": {"max_tokens": 2000}})
     assert out2["arguments"]["max_tokens"] == 2000
+
+
+def test_verify_allows_package_provider_and_leaf_names(tmp_path):
+    # meta-doc regression: a README ABOUT the orchestrator names the package, provider
+    # prefixes, wildcards, and leaf tools defined in sibling repos — none are hallucinations.
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n', encoding="utf-8")
+    pkg = tmp_path / "orchestrate_codex"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "mcp_server.py").write_text('T = [{"name": "orchestrate_advise"}]\n', encoding="utf-8")
+    facts = gather.gather_durable_facts(tmp_path)
+    assert "orchestrate_codex" in facts["packages"]
+    body = (
+        "The orchestrate_codex package routes to the google_antigravity_write leaf and "
+        "claude_codex_chat. Wildcards like google_antigravity_* are supported. " * 4
+    )
+    r = verify.verify_text(body, doc_class="durable", fact_pack=facts)
+    assert not any(w.startswith("tool_not_in_fact_pack") for w in r["warnings"]), r["warnings"]
+    # a truly invented tool is still caught
+    bad = verify.verify_text("Call orchestrate_teleport." * 20, doc_class="durable", fact_pack=facts)
+    assert any("orchestrate_teleport" in w for w in bad["warnings"])
+    # sibling-repo launcher commands referenced in a meta-doc are legitimate
+    meta = "Run the leaf servers grok_codex_mcp, claude_codex_mcp, google_antigravity_mcp. " * 4
+    r2 = verify.verify_text(meta, doc_class="durable", fact_pack=facts)
+    assert not any(w.startswith("tool_not_in_fact_pack") for w in r2["warnings"]), r2["warnings"]
+
+
+def test_verify_session_diary_noun_not_flagged():
+    # "session diary" as policy vocabulary (not recency tone) must not trigger recency
+    body = "이 문서는 durable 정책을 따르며 session diary 를 제외합니다. " * 8
+    r = verify.verify_text(body, doc_class="durable")
+    assert not any("recency" in w for w in r["warnings"])
+    # actual recency tone still caught
+    assert any("recency" in w for w in verify.verify_text("today we fixed it " * 20, doc_class="durable")["warnings"])
 
 
 def test_change_doc_recency_not_flagged():

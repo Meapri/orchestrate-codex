@@ -5,17 +5,45 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from . import catalog
+
+# Recency/session-diary TONE, not vocabulary — "session diary" as a bare noun is dropped
+# because durable docs that describe the policy legitimately mention it.
 RECENCY_PATTERNS = [
     r"\btoday we\b",
     r"\bjust fixed\b",
     r"\brecently fixed\b",
     r"\bHTTP 400\b",
-    r"\bsession diary\b",
     r"\bthis session\b",
     r"\b방금 수정\b",
     r"\b오늘 고친\b",
-    r"\b최근 작업\b",
+    # "session diary" and "최근 작업" (recent-work) are dropped: they are policy
+    # VOCABULARY that durable meta-docs legitimately describe, not recency tone.
 ]
+
+# Leaf tools this orchestrator knows about — legitimate references in its own docs even
+# though they're defined in sibling repos (so not in the local fact pack).
+_KNOWN_LEAF_TOOLS = {c["leaf"] for c in catalog.CAPABILITIES} | set(catalog.LATEST_MODELS)
+
+# Standard per-provider CLI/console commands present in every leaf repo (e.g. the MCP
+# launcher `grok_codex_mcp`, `*_doctor`, `*_consent`). A meta-doc referencing these is
+# not hallucinating — but the local fact pack can't see the sibling repos.
+_LEAF_PROVIDERS = ("claude_codex", "grok_codex", "google_antigravity")
+_LEAF_CMD_SUFFIXES = (
+    "mcp", "doctor", "consent", "login", "logout",
+    "consent_status", "login_status", "provider_status", "list_models",
+)
+_KNOWN_LEAF_COMMANDS = {f"{p}_{s}" for p in _LEAF_PROVIDERS for s in _LEAF_CMD_SUFFIXES}
+
+
+def _is_known_token(token: str, allowed: set) -> bool:
+    """A claimed token is legitimate if it's a known tool/command/package, OR a prefix of
+    one (a provider like `google_antigravity`), OR a wildcard/partial of one
+    (`google_antigravity_` for `google_antigravity_write`). Only genuinely invented names
+    (no relation to any real token) are flagged."""
+    if token in allowed:
+        return True
+    return any(known.startswith(token) or token.startswith(known) for known in allowed)
 
 
 def verify_text(
@@ -41,14 +69,19 @@ def verify_text(
         allowed: set = set()
         if isinstance(fact_pack, dict):
             tools = list(fact_pack.get("mcp_tools_detected") or [])
-            # CLI commands / console scripts are legitimate references, not hallucinated tools.
-            allowed = set(tools) | set(fact_pack.get("cli_commands") or [])
+            # CLI commands, console scripts, and package names are legitimate references,
+            # not hallucinated tools — important for docs that describe the tooling itself.
+            allowed = (
+                set(tools)
+                | set(fact_pack.get("cli_commands") or [])
+                | set(fact_pack.get("packages") or [])
+                | _KNOWN_LEAF_TOOLS
+                | _KNOWN_LEAF_COMMANDS
+            )
         # flag tool-like tokens not in fact pack when pack known
         if tools:
             claimed = set(re.findall(r"\b(?:google|claude_codex|grok_codex|orchestrate)_[a-z0-9_]+\b", body))
-            unknown = sorted(t for t in claimed if t not in allowed)
-            # only warn if we found claimed tools and some unknown — allow subset
-            # unknown means claimed not in detected list
+            unknown = sorted(t for t in claimed if not _is_known_token(t, allowed))
             for t in unknown:
                 warnings.append(f"tool_not_in_fact_pack:{t}")
     warnings.extend(_completeness_warnings(body))

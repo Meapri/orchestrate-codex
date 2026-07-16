@@ -203,31 +203,28 @@ def _args_for_tool(
     """
     family = _tool_family(tool)
     if family == "write":
-        return _enrich_write_args(step, user_args=user_args, pol=pol, artifacts=artifacts)
-    if family == "search":
+        args = _enrich_write_args(step, user_args=user_args, pol=pol, artifacts=artifacts)
+    elif family == "search":
         prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
-        args: Dict[str, Any] = {"query": prompt or step.get("suggested_arguments", {}).get("query") or "status"}
+        args = {"query": prompt or step.get("suggested_arguments", {}).get("query") or "status"}
         if user_args.get("model"):
             args["model"] = user_args["model"]
         for key in ("language", "freshness", "max_sources"):
             if user_args.get(key) not in (None, ""):
                 args[key] = user_args[key]
-        return args
-    if family == "image":
+    elif family == "image":
         prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
         args = {"prompt": prompt or str(step.get("instruction") or "")}
         for key in ("model", "aspect_ratio", "image_size"):
             if user_args.get(key) not in (None, ""):
                 args[key] = user_args[key]
-        return args
-    if family == "compare":
+    elif family == "compare":
         prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
         args = {"prompt": prompt or str(step.get("instruction") or "")}
         # COMPARE_SCHEMA takes `models` (plural), not `model`.
         if user_args.get("models") not in (None, "", []):
             args["models"] = user_args["models"]
-        return args
-    if family == "review_diff":
+    elif family == "review_diff":
         prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
         args = {"cwd": str(user_args.get("project_root") or ".")}
         if prompt:
@@ -235,15 +232,45 @@ def _args_for_tool(
         for key in ("focus", "base", "ref", "staged", "paths", "model"):
             if user_args.get(key) not in (None, ""):
                 args[key] = user_args[key]
-        return args
-    if family == "release":
+    elif family == "release":
         args = {"repo": str(user_args.get("project_root") or user_args.get("repo") or ".")}
         for key in ("base_ref", "head_ref", "title", "version", "tag", "polish", "model"):
             if user_args.get(key) not in (None, ""):
                 args[key] = user_args[key]
-        return args
-    # chat family (including write→chat degradation): fold artifacts into the prompt
-    return _enrich_chat_args(step, user_args=user_args, pol=pol, artifacts=artifacts)
+    else:
+        # chat family (including write→chat degradation): fold artifacts into the prompt
+        args = _enrich_chat_args(step, user_args=user_args, pol=pol, artifacts=artifacts)
+
+    # A model id is provider-specific. When a stage falls back to a different-provider
+    # tool, a carried-over model (e.g. grok-4.5 sent to a Gemini/Claude leaf) 404s — so
+    # normalize the model to the SELECTED tool's provider (or drop it for the leaf default).
+    if family not in {"compare"}:
+        model = _resolve_model_for_tool(tool, args.get("model"))
+        if model:
+            args["model"] = model
+        else:
+            args.pop("model", None)
+    return args
+
+
+_PROVIDER_MODEL_PREFIX = {
+    "grok_codex": "grok",
+    "claude_codex": "claude",
+    "google_antigravity": "gemini",
+    "google_grounded": "gemini",
+}
+
+
+def _resolve_model_for_tool(tool: str, requested: Optional[str]) -> Optional[str]:
+    """Return a model id valid for `tool`'s provider: keep a compatible request, else the
+    provider's latest (catalog), else None so the leaf uses its own default."""
+    provider = next((p for p in _PROVIDER_MODEL_PREFIX if str(tool).startswith(p)), None)
+    if requested:
+        if provider is None:
+            return requested  # unknown provider — trust the caller
+        if str(requested).lower().startswith(_PROVIDER_MODEL_PREFIX[provider]):
+            return requested  # already matches this provider
+    return catalog.latest_for(tool)
 
 
 def _build_steps(recipe: Dict[str, Any], bindings: Dict[str, str], user_args: Dict[str, Any], pol: Dict[str, Any]) -> List[Dict[str, Any]]:
