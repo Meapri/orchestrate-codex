@@ -1,13 +1,34 @@
 ---
 name: orchestrate
-description: "Use orchestrate-codex for multi-step supervised recipes across Claude, Grok, and Antigravity leaf MCPs."
+description: "Supervised multi-step recipes across Claude, Grok, and Antigravity leaf MCPs (start_run → leaf → continue)."
 ---
 
-# Orchestrate
+# Orchestrate (v0.2)
 
-1. `orchestrate_list_recipes` to pick a recipe.
-2. `orchestrate_plan_recipe` with `recipe_id` and user `prompt`.
-3. Execute each step's `tool` via the corresponding leaf MCP (do not invent tools).
-4. For README/docs use `durable_readme` (git off, no session diary).
-5. For PR notes use `change_pr`.
-6. Override leaf with `bindings` e.g. `{"chat":"grok_codex_chat"}`.
+## Flow
+
+1. `orchestrate_start_run` with `recipe_id`, `prompt`, optional `project_root`, `bindings`.
+2. Read `next_action`:
+   - `call_tool` → invoke that **leaf** MCP tool with `arguments` (do not invent tools).
+   - `done` → finished.
+3. After leaf returns: `orchestrate_continue_recipe` with `run_id`, `stage_id`, `result_text`, `success`.
+4. On leaf failure: `success=false` — orchestrator rotates `fallback_tools` (chat: Claude→Grok→AG).
+5. Pass full `state` back if the MCP process may restart.
+
+## Recipes
+
+| id | class | notes |
+| --- | --- | --- |
+| `durable_readme` | durable | auto fact pack; no git diary |
+| `change_pr` | change | auto git snapshot |
+| `research_then_write` | transform | AG grounded search then chat |
+| `direct_chat` | direct | single leaf chat |
+
+## Bindings
+
+Default chat = `claude_codex_chat`. Override: `{"chat":"grok_codex_chat"}`.
+
+## Do not
+
+- Put session diary into durable README prompts.
+- Call leaf HTTP yourself inside orchestrate — only plan/state.

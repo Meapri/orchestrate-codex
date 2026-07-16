@@ -184,7 +184,7 @@ def plan_recipe(
         "mode": "supervised",
         "note": (
             "Execute each step's tool in order via Codex MCP. "
-            "This orchestrator does not call leaf HTTP APIs itself in v0.1."
+            "This orchestrator does not call leaf HTTP APIs itself (v0.2 supervised)."
         ),
         "steps": steps,
         "user_args": args,
