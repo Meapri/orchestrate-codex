@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orchestrate-codex"
-version = "0.2.0"
+version = "0.5.2"
 description = "Provider-neutral recipe orchestration MCP for Codex multi-provider leaves."
 readme = "README.md"
 requires-python = ">=3.9"
