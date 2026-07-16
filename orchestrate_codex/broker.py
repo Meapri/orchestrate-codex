@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import catalog
+from . import catalog, errors
 from . import leaves as leaves_mod
 from . import runner
 from .leaf_client import LeafClient, LeafError
@@ -109,7 +109,14 @@ def run_auto(
                     ok, text = client.call_tool(tool, na.get("arguments") or {}, timeout=per_call_timeout)
                 except LeafError as exc:
                     ok, text = False, str(exc)
-                trace.append({"stage": stage, "tool": tool, "ok": ok, "result_chars": len(text)})
+                # A leaf may hand back a transport/backend error (HTTP 503, connection
+                # refused) as "successful" text — treat that as a failure so the runner
+                # rotates to a fallback instead of using the error string as content.
+                soft_error = ok and errors.looks_like_leaf_error(text)
+                if soft_error:
+                    ok = False
+                trace.append({"stage": stage, "tool": tool, "ok": ok,
+                              "result_chars": len(text), "soft_error": soft_error})
                 state = runner.continue_run(
                     run_id=state["run_id"], stage_id=stage,
                     result_text=text if ok else "", success=ok, error="" if ok else text,
