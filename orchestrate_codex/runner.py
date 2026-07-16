@@ -7,17 +7,44 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from . import gather, policy, recipes, verify
+from . import __version__, catalog, errors, gather, policy, recipes, store, verify
 
 # capability → ordered fallback tools (first is primary unless bindings override)
 FALLBACK_CHAINS: Dict[str, List[str]] = {
     "chat": ["claude_codex_chat", "grok_codex_chat", "google_antigravity_chat"],
     "grounded_search": ["google_grounded_search"],
     "image": ["google_antigravity_generate_image"],
-    "write_ag": ["google_antigravity_write"],
+    # A structured writing stage prefers Antigravity's `write` leaf (which self-grounds
+    # a durable fact pack for readme/technical-doc), then degrades to a generic chat leaf.
+    "write": ["google_antigravity_write", "claude_codex_chat", "grok_codex_chat"],
+    # Antigravity-specific structured tools — no cross-provider fallback.
+    "review_diff": ["google_antigravity_review_diff"],
+    "release": ["google_antigravity_release_draft"],
+    "compare": ["google_antigravity_compare_models"],
 }
 
+# Max concurrently-retained runs; oldest evicted first (in-process store only).
+MAX_RUNS = 200
+
 _RUNS: Dict[str, Dict[str, Any]] = {}
+
+
+def _tool_family(tool: str) -> str:
+    """Group a leaf tool by the argument shape it expects."""
+    t = tool or ""
+    if t.endswith("_write"):
+        return "write"
+    if t.endswith("grounded_search") or t.endswith("_search"):
+        return "search"
+    if t.endswith("_generate_image") or t.endswith("_image"):
+        return "image"
+    if t.endswith("_review_diff"):
+        return "review_diff"
+    if t.endswith("_release_draft") or t.endswith("_release_snapshot"):
+        return "release"
+    if t.endswith("_compare_models"):
+        return "compare"
+    return "chat"
 
 
 def _bindings(overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -41,6 +68,24 @@ def _fallback_tools(capability: str, bindings: Dict[str, str]) -> List[str]:
     return chain
 
 
+def _stage_model(step: Dict[str, Any], user_args: Dict[str, Any]) -> Optional[str]:
+    """Resolve the model for a stage: per-stage `models` map > stage default > global `model`.
+
+    `user_args["models"]` is a dict keyed by stage id, so a multi-LLM recipe can send a
+    different model to each leaf (e.g. Claude=opus, Grok=grok-4, writer=gemini-pro).
+    """
+    models = user_args.get("models")
+    if isinstance(models, dict):
+        picked = models.get(step.get("id"))
+        if picked:
+            return str(picked)
+    if step.get("model"):
+        return str(step["model"])
+    if user_args.get("model"):
+        return str(user_args["model"])
+    return None
+
+
 def _enrich_chat_args(
     step: Dict[str, Any],
     *,
@@ -48,12 +93,15 @@ def _enrich_chat_args(
     pol: Dict[str, Any],
     artifacts: Dict[str, Any],
 ) -> Dict[str, Any]:
-    args = dict(step.get("suggested_arguments") or {})
+    # Build fresh — never inherit a prior tool's argument shape (e.g. a write→chat fallback).
+    args: Dict[str, Any] = {}
     prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
     parts = [
         f"[orchestrate stage={step.get('id')} doc_class={pol.get('doc_class')}]",
         str(step.get("instruction") or ""),
     ]
+    if step.get("revise_notes"):
+        parts.append("REVISE — fix these local-check failures: " + "; ".join(str(n) for n in step["revise_notes"]))
     if artifacts.get("facts_text"):
         parts.append("FACT PACK:\n" + str(artifacts["facts_text"]))
     if artifacts.get("git_text") and pol.get("git") == "on":
@@ -62,17 +110,131 @@ def _enrich_chat_args(
         parts.append("OUTLINE:\n" + str(artifacts["outline"]))
     if artifacts.get("search"):
         parts.append("SEARCH RESULTS:\n" + str(artifacts["search"]))
+    if artifacts.get("code_text"):
+        parts.append(str(artifacts["code_text"]))
+    if artifacts.get("findings_text"):
+        parts.append("PRIOR FINDINGS FROM OTHER ANALYSTS:\n" + str(artifacts["findings_text"]))
+    if user_args.get("source_text"):
+        parts.append("SOURCE TEXT:\n" + str(user_args["source_text"]))
+    if user_args.get("target_language"):
+        parts.append("TARGET LANGUAGE: " + str(user_args["target_language"]))
     if prompt:
         parts.append("User request:\n" + prompt)
     if step.get("capability") == "grounded_search":
         args["query"] = prompt or args.get("query") or "status"
     else:
         args["prompt"] = "\n\n".join(p for p in parts if p)
-    if user_args.get("model"):
-        args["model"] = user_args["model"]
+    model = _stage_model(step, user_args)
+    if model:
+        args["model"] = model
     if user_args.get("system"):
         args["system"] = user_args["system"]
     return args
+
+
+def _enrich_write_args(
+    step: Dict[str, Any],
+    *,
+    user_args: Dict[str, Any],
+    pol: Dict[str, Any],
+    artifacts: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Arguments for a structured `*_write` leaf (WRITING_SCHEMA shape).
+
+    The write leaf collects its own durable fact pack for readme/technical-doc and
+    enforces durable safety, so we hand it a task + instruction + project_root and
+    let it ground the whole project itself instead of pushing a prompt blob.
+    """
+    artifacts = artifacts or {}
+    instruction = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
+    full_instruction = instruction or str(step.get("instruction") or "")
+    if step.get("revise_notes"):
+        full_instruction += (
+            "\n\nREVISE — the previous draft failed these local checks; fix each: "
+            + "; ".join(str(n) for n in step["revise_notes"])
+        )
+    args: Dict[str, Any] = {
+        "task": str(step.get("write_task") or "auto"),
+        "instruction": full_instruction,
+        "project_root": str(user_args.get("project_root") or "."),
+        "output_mode": "final",
+    }
+    # For change-class tasks let the leaf pull git context; durable tasks force it off.
+    if pol.get("git") == "on":
+        args["project_context"] = "auto"
+    if user_args.get("output_mode"):
+        args["output_mode"] = user_args["output_mode"]
+    for key in recipes.WRITE_PASSTHROUGH:
+        if user_args.get(key) not in (None, ""):
+            args[key] = user_args[key]
+    model = _stage_model(step, user_args)  # per-stage override wins over global
+    if model:
+        args["model"] = model
+    # Feed an upstream stage's output (e.g. grounded search) as the source to transform,
+    # unless the caller supplied explicit source text/file.
+    if "source_text" not in args and "source_file" not in args:
+        upstream = artifacts.get("findings_text") or artifacts.get("search") or artifacts.get("outline")
+        if upstream:
+            args["source_text"] = str(upstream)
+    return args
+
+
+def _args_for_tool(
+    step: Dict[str, Any],
+    tool: str,
+    *,
+    user_args: Dict[str, Any],
+    pol: Dict[str, Any],
+    artifacts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build leaf arguments matching the *selected* tool, not just the capability.
+
+    A single stage may fall back from `google_antigravity_write` to `claude_codex_chat`;
+    the two demand different argument shapes, so shape follows the tool actually chosen.
+    """
+    family = _tool_family(tool)
+    if family == "write":
+        return _enrich_write_args(step, user_args=user_args, pol=pol, artifacts=artifacts)
+    if family == "search":
+        prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
+        args: Dict[str, Any] = {"query": prompt or step.get("suggested_arguments", {}).get("query") or "status"}
+        if user_args.get("model"):
+            args["model"] = user_args["model"]
+        for key in ("language", "freshness", "max_sources"):
+            if user_args.get(key) not in (None, ""):
+                args[key] = user_args[key]
+        return args
+    if family == "image":
+        prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
+        args = {"prompt": prompt or str(step.get("instruction") or "")}
+        for key in ("model", "aspect_ratio", "image_size"):
+            if user_args.get(key) not in (None, ""):
+                args[key] = user_args[key]
+        return args
+    if family == "compare":
+        prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
+        args = {"prompt": prompt or str(step.get("instruction") or "")}
+        # COMPARE_SCHEMA takes `models` (plural), not `model`.
+        if user_args.get("models") not in (None, "", []):
+            args["models"] = user_args["models"]
+        return args
+    if family == "review_diff":
+        prompt = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
+        args = {"cwd": str(user_args.get("project_root") or ".")}
+        if prompt:
+            args["instruction"] = prompt
+        for key in ("focus", "base", "ref", "staged", "paths", "model"):
+            if user_args.get(key) not in (None, ""):
+                args[key] = user_args[key]
+        return args
+    if family == "release":
+        args = {"repo": str(user_args.get("project_root") or user_args.get("repo") or ".")}
+        for key in ("base_ref", "head_ref", "title", "version", "tag", "polish", "model"):
+            if user_args.get(key) not in (None, ""):
+                args[key] = user_args[key]
+        return args
+    # chat family (including write→chat degradation): fold artifacts into the prompt
+    return _enrich_chat_args(step, user_args=user_args, pol=pol, artifacts=artifacts)
 
 
 def _build_steps(recipe: Dict[str, Any], bindings: Dict[str, str], user_args: Dict[str, Any], pol: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -84,7 +246,11 @@ def _build_steps(recipe: Dict[str, Any], bindings: Dict[str, str], user_args: Di
         if tool is None and binding:
             tool = bindings.get(str(binding))
         fallbacks = _fallback_tools(capability, bindings) if capability in FALLBACK_CHAINS else []
-        if tool and tool not in fallbacks and capability in FALLBACK_CHAINS:
+        # The stage's bound tool must be the PRIMARY (attempt 0), even when it already
+        # appears later in the capability's fallback chain — otherwise a stage bound to
+        # e.g. grok would silently run claude (fallback[0]). This makes per-stage leaf
+        # selection authoritative, which multi-LLM recipes depend on.
+        if tool and capability in FALLBACK_CHAINS:
             fallbacks = [tool] + [t for t in fallbacks if t != tool]
         step = {
             "index": i,
@@ -94,6 +260,7 @@ def _build_steps(recipe: Dict[str, Any], bindings: Dict[str, str], user_args: Di
             "tool": tool,
             "fallback_tools": fallbacks,
             "tool_attempt_index": 0,
+            "write_task": stage.get("write_task"),
             "instruction": stage.get("instruction"),
             "suggested_arguments": recipes._suggest_args(stage, user_args, pol),
             "status": "pending",
@@ -127,7 +294,7 @@ def start_run(
         "bindings": bind,
         "fallback_chains": FALLBACK_CHAINS,
         "mode": "supervised",
-        "version": "0.2.0",
+        "version": __version__,
         "created_at": time.time(),
         "user_args": user_args,
         "project_root": str(user_args.get("project_root") or project_root or "."),
@@ -135,21 +302,50 @@ def start_run(
         "artifacts": {},
         "cursor": 0,
         "status": "running",
+        "revisions": 0,
+        "revision_budget": (
+            int(user_args["revision_budget"])
+            if str(user_args.get("revision_budget", "")).strip() != ""
+            else DEFAULT_REVISION_BUDGET
+        ),
         "note": (
             "Call leaf MCP tools for steps with a tool. "
             "Local gather/verify run automatically. "
             "Then orchestrate_continue_recipe with stage result."
         ),
     }
+    # Warn (non-fatal) if a recipe with a generative stage got no prompt to work from.
+    needs_prompt = any(
+        s.get("capability") in {"chat", "grounded_search", "write"} for s in state["steps"]
+    )
+    prompt_text = str(user_args.get("prompt") or user_args.get("instruction") or "").strip()
+    if needs_prompt and not prompt_text:
+        state.setdefault("warnings", []).append("missing_prompt: recipe has a generative stage but no prompt/instruction")
     if auto_local:
         _auto_local_forward(state)
-    _RUNS[run_id] = state
+    _store(state)
+    _prune_runs()
     return _public_state(state)
 
 
+def _prune_runs() -> None:
+    """Bound the in-process run store; evict oldest runs first."""
+    if len(_RUNS) <= MAX_RUNS:
+        return
+    ordered = sorted(_RUNS.values(), key=lambda s: float(s.get("created_at") or 0.0))
+    for stale in ordered[: len(_RUNS) - MAX_RUNS]:
+        _RUNS.pop(str(stale.get("run_id") or ""), None)
+
+
 def load_state(state_or_id: Any) -> Dict[str, Any]:
-    if isinstance(state_or_id, str) and state_or_id in _RUNS:
-        return _RUNS[state_or_id]
+    if isinstance(state_or_id, str) and state_or_id:
+        if state_or_id in _RUNS:
+            return _RUNS[state_or_id]
+        # Not in memory — try the on-disk store (survives process restart).
+        persisted = store.load(state_or_id)
+        if persisted is not None:
+            _RUNS[state_or_id] = persisted
+            return persisted
     if isinstance(state_or_id, dict) and state_or_id.get("steps"):
         return copy.deepcopy(state_or_id)
     raise ValueError("Provide run_id from start_run or a full state object")
@@ -180,19 +376,19 @@ def _next_action(state: Dict[str, Any]) -> Dict[str, Any]:
     if not step:
         return {"type": "done", "message": "No more steps"}
     if step.get("status") == "ready" or step.get("status") == "pending":
-        # refresh chat args with artifacts
         pol = state.get("context_policy") or {}
-        if step.get("capability") in {"chat", "grounded_search"}:
-            step["suggested_arguments"] = _enrich_chat_args(
-                step,
-                user_args=state.get("user_args") or {},
-                pol=pol,
-                artifacts=state.get("artifacts") or {},
-            )
         if step.get("tool"):
             tools = step.get("fallback_tools") or ([step["tool"]] if step.get("tool") else [])
             idx = int(step.get("tool_attempt_index") or 0)
             tool = tools[idx] if idx < len(tools) else step.get("tool")
+            # Argument shape follows the leaf actually selected (write vs chat vs search).
+            step["suggested_arguments"] = _args_for_tool(
+                step,
+                tool,
+                user_args=state.get("user_args") or {},
+                pol=pol,
+                artifacts=state.get("artifacts") or {},
+            )
             return {
                 "type": "call_tool",
                 "stage_id": step["id"],
@@ -219,6 +415,7 @@ def _auto_local_forward(state: Dict[str, Any]) -> None:
         if step.get("kind") not in {"gather", "verify"} and step.get("capability") not in {
             "local",
             "local_git",
+            "local_code",
         }:
             return
         if step.get("status") in {"completed", "failed"}:
@@ -231,7 +428,7 @@ def _auto_local_forward(state: Dict[str, Any]) -> None:
             state["status"] = "failed"
             state["error"] = step.get("error")
             return
-        state["cursor"] = int(state.get("cursor") or 0) + 1
+        _advance_cursor(state)  # honors a verify-scheduled revision rewind
         if state["cursor"] >= len(state["steps"]):
             state["status"] = "completed"
             return
@@ -240,7 +437,12 @@ def _auto_local_forward(state: Dict[str, Any]) -> None:
 def _run_local_step(state: Dict[str, Any], step: Dict[str, Any]) -> None:
     root = str(state.get("project_root") or ".")
     try:
-        if step.get("kind") == "gather" or step.get("capability") in {"local", "local_git"}:
+        # Check verify FIRST: verify stages also carry capability "local", so the gather
+        # branch below would otherwise swallow them and they'd never actually verify.
+        is_gather = step.get("kind") == "gather" or (
+            step.get("kind") != "verify" and step.get("capability") in {"local", "local_git"}
+        )
+        if is_gather:
             data = gather.run_gather(step, project_root=root, args=state.get("user_args") or {})
             step["status"] = "completed" if data.get("ok", True) else "failed"
             step["result_text"] = str(data.get("text") or "")
@@ -250,6 +452,9 @@ def _run_local_step(state: Dict[str, Any], step: Dict[str, Any]) -> None:
             if step.get("id") == "gather_git" or step.get("capability") == "local_git":
                 artifacts["git"] = data
                 artifacts["git_text"] = data.get("text")
+            elif step.get("id") == "gather_code" or step.get("capability") == "local_code":
+                artifacts["code"] = data
+                artifacts["code_text"] = data.get("text")
             else:
                 artifacts["facts"] = data
                 artifacts["facts_text"] = data.get("text")
@@ -274,12 +479,49 @@ def _run_local_step(state: Dict[str, Any], step: Dict[str, Any]) -> None:
             if result.get("warnings"):
                 state.setdefault("warnings", [])
                 state["warnings"].extend(result["warnings"])
+            _maybe_schedule_revision(state, step, result.get("warnings") or [])
             return
         step["status"] = "completed"
         step["result_text"] = ""
     except Exception as exc:  # noqa: BLE001
         step["status"] = "failed"
         step["error"] = str(exc)
+
+
+# Warning prefixes worth re-drafting for (vs. purely informational ones).
+_ACTIONABLE_WARNINGS = ("recency_language", "tool_not_in_fact_pack", "git_internals")
+DEFAULT_REVISION_BUDGET = 1
+
+
+def _maybe_schedule_revision(state: Dict[str, Any], verify_step: Dict[str, Any], warnings: List[str]) -> None:
+    """Turn verify from advisory into a control loop: on actionable warnings, rewind
+    to the draft stage with correction notes, up to a bounded revision budget."""
+    actionable = [w for w in warnings if w.startswith(_ACTIONABLE_WARNINGS)]
+    if not actionable:
+        return
+    budget = int(state.get("revision_budget", DEFAULT_REVISION_BUDGET))
+    used = int(state.get("revisions", 0))
+    if used >= budget:
+        return
+    draft_idx = next((i for i, s in enumerate(state["steps"]) if s.get("id") == "draft"), None)
+    if draft_idx is None:
+        return
+    state["revisions"] = used + 1
+    draft = state["steps"][draft_idx]
+    draft["status"] = "pending"
+    draft["tool_attempt_index"] = 0  # retry the primary (write) leaf
+    draft["revise_notes"] = actionable
+    verify_step["status"] = "pending"  # re-verify the revised draft
+    state["_revise_to"] = draft_idx
+
+
+def _advance_cursor(state: Dict[str, Any]) -> None:
+    """Advance past the current step, unless a revision rewind was scheduled."""
+    rewind = state.pop("_revise_to", None)
+    if rewind is not None:
+        state["cursor"] = int(rewind)
+    else:
+        state["cursor"] = int(state.get("cursor") or 0) + 1
 
 
 def continue_run(
@@ -313,9 +555,11 @@ def continue_run(
             out = _public_state(st)
             _store(st)
             return out
-        st["cursor"] = int(st.get("cursor") or 0) + 1
+        _advance_cursor(st)  # honors a verify-scheduled revision rewind
         if auto_local:
             _auto_local_forward(st)
+        if st.get("cursor", 0) >= len(st["steps"]) and st.get("status") == "running":
+            st["status"] = "completed"
         out = _public_state(st)
         _store(st)
         return out
@@ -332,6 +576,13 @@ def continue_run(
             artifacts["draft"] = result_text
         elif step.get("id") == "search":
             artifacts["search"] = result_text
+        elif str(step.get("id") or "").startswith("investigate"):
+            # Multi-LLM investigation: accumulate each analyst's findings for the writer.
+            fnd = artifacts.setdefault("findings", [])
+            fnd.append({"analyst": step.get("tool"), "stage": step.get("id"), "text": result_text})
+            artifacts["findings_text"] = "\n\n".join(
+                f"### Finding — {f['stage']} (by {f['analyst']}):\n{f['text']}" for f in fnd
+            )
         st["cursor"] = int(st.get("cursor") or 0) + 1
         if st["cursor"] >= len(st["steps"]):
             st["status"] = "completed"
@@ -340,17 +591,20 @@ def continue_run(
             if st.get("cursor", 0) >= len(st["steps"]) and st.get("status") == "running":
                 st["status"] = "completed"
     else:
-        # try fallback tool
+        err_text = error or result_text or "leaf failed"
+        category = errors.classify(err_text)
+        step["error_category"] = category
         tools = step.get("fallback_tools") or []
         idx = int(step.get("tool_attempt_index") or 0) + 1
-        if idx < len(tools):
+        # A malformed-request error won't be fixed by another provider — fail fast.
+        if idx < len(tools) and errors.should_rotate(category):
             step["tool_attempt_index"] = idx
             step["status"] = "pending"
-            step["error"] = error or result_text or "leaf failed; trying fallback"
+            step["error"] = f"{err_text} [{category}; rotating to {tools[idx]}]"
             step["tool"] = tools[idx]
         else:
             step["status"] = "failed"
-            step["error"] = error or result_text or "leaf failed"
+            step["error"] = f"{err_text} [{category}]"
             st["status"] = "failed"
             st["error"] = step["error"]
 
@@ -363,9 +617,150 @@ def _store(state: Dict[str, Any]) -> None:
     rid = str(state.get("run_id") or "")
     if rid:
         _RUNS[rid] = state
+        store.save(state)
+
+
+_CAP_BINDING = {
+    "chat": "chat",
+    "write": "write_ag",
+    "grounded_search": "grounded_search",
+    "image": "image",
+    "review_diff": "review_diff",
+    "release": "release",
+    "compare": "compare",
+}
+
+
+def prepare_step(
+    *,
+    capability: str = "chat",
+    instruction: str,
+    doc_class: str = "direct",
+    model: Optional[str] = None,
+    leaf: Optional[str] = None,
+    write_task: Optional[str] = None,
+    gather_kind: Optional[str] = None,
+    project_root: str = ".",
+    context: Optional[str] = None,
+    bindings: Optional[Dict[str, str]] = None,
+    extra_args: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Prepare ONE ready-to-call leaf invocation for a host-planned delegation.
+
+    The host model (GPT) decides *what* to delegate and *to whom*; this resolves the
+    tool + latest model, injects deterministic context (facts/code/git) and any prior
+    findings, applies the doc-class policy, and returns a fully-formed call. The host
+    then invokes `tool` with `arguments` and (for durable/transform) runs verify.
+    """
+    capability = str(capability or "chat")
+    pol = policy.get_policy(doc_class)
+    bind = _bindings(bindings)
+
+    tool = leaf or (bind.get(_CAP_BINDING[capability]) if capability in _CAP_BINDING else None)
+    fallbacks = _fallback_tools(capability, bind) if capability in FALLBACK_CHAINS else []
+    if tool and capability in FALLBACK_CHAINS:
+        fallbacks = [tool] + [t for t in fallbacks if t != tool]
+    elif not tool and fallbacks:
+        tool = fallbacks[0]
+    if not tool:
+        raise ValueError(f"cannot resolve a leaf for capability={capability!r}")
+
+    resolved_model = model or catalog.latest_for(tool)
+
+    artifacts: Dict[str, Any] = {}
+    root = str(project_root or ".")
+    if gather_kind == "facts":
+        d = gather.gather_durable_facts(root)
+        artifacts["facts"] = d
+        artifacts["facts_text"] = d.get("text")
+    elif gather_kind == "code":
+        d = gather.gather_code_context(root)
+        artifacts["code_text"] = d.get("text")
+    elif gather_kind == "git":
+        d = gather.gather_git(root)
+        artifacts["git_text"] = d.get("text")
+    if context:
+        artifacts["findings_text"] = str(context)
+
+    step = {
+        "id": "step",
+        "capability": capability,
+        "write_task": write_task,
+        "instruction": instruction,
+        "tool": tool,
+        "fallback_tools": fallbacks,
+    }
+    user_args: Dict[str, Any] = {"instruction": instruction, "project_root": root}
+    if resolved_model:
+        user_args["model"] = resolved_model
+    if extra_args:
+        user_args.update({k: v for k, v in extra_args.items() if v is not None})
+
+    args = _args_for_tool(step, tool, user_args=user_args, pol=pol, artifacts=artifacts)
+    return {
+        "capability": capability,
+        "doc_class": doc_class,
+        "tool": tool,
+        "fallback_tools": fallbacks,
+        "model": args.get("model") or resolved_model,
+        "arguments": args,
+        "gathered": [k for k in ("facts_text", "code_text", "git_text", "findings_text") if k in artifacts],
+        "verify_after": doc_class in {"durable", "transform"},
+        "note": (
+            "Call `tool` with `arguments`. On failure, call the next entry in `fallback_tools`. "
+            "If `verify_after`, submit the result text to orchestrate_verify with this doc_class."
+        ),
+    }
+
+
+def resolve_bindings(
+    available_tools: Optional[List[str]] = None,
+    *,
+    bindings: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Given the leaf tools actually connected (from the client's tools/list), pick a
+    primary + fallback chain per capability and report which recipes are runnable.
+
+    If `available_tools` is empty/None, no filtering is applied (assume all defaults present).
+    """
+    present = {str(t) for t in (available_tools or [])}
+    bind = _bindings(bindings)
+    chains: Dict[str, List[str]] = {}
+    resolved: Dict[str, str] = {}
+    for capability in FALLBACK_CHAINS:
+        chain = _fallback_tools(capability, bind)
+        usable = [t for t in chain if t in present] if present else chain
+        chains[capability] = usable
+        if usable:
+            resolved[capability] = usable[0]
+
+    runnable: List[str] = []
+    blocked: List[Dict[str, Any]] = []
+    for rid, recipe in recipes.all_recipes().items():
+        missing = sorted({
+            str(stage.get("capability"))
+            for stage in recipe["stages"]
+            if stage.get("capability") in FALLBACK_CHAINS and not chains.get(str(stage.get("capability")))
+        })
+        if missing:
+            blocked.append({"id": rid, "missing_capabilities": missing})
+        else:
+            runnable.append(rid)
+    return {
+        "available_tools_seen": sorted(present),
+        "filtered": bool(present),
+        "bindings": resolved,
+        "fallback_chains": chains,
+        "runnable_recipes": sorted(runnable),
+        "blocked_recipes": blocked,
+    }
 
 
 def get_run(run_id: str) -> Dict[str, Any]:
-    if run_id not in _RUNS:
-        raise ValueError(f"unknown run_id: {run_id}")
-    return _public_state(_RUNS[run_id])
+    if run_id in _RUNS:
+        return _public_state(_RUNS[run_id])
+    persisted = store.load(run_id)
+    if persisted is not None:
+        _RUNS[run_id] = persisted
+        return _public_state(persisted)
+    raise ValueError(f"unknown run_id: {run_id}")

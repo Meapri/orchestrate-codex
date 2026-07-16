@@ -22,7 +22,8 @@ def _run(cmd: List[str], cwd: Path, timeout: float = 20.0) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     if proc.returncode != 0:
-        return (proc.stdout or proc.stderr or "").strip()
+        # Non-zero exit: do not pass stdout/stderr off as real content.
+        return ""
     return (proc.stdout or "").strip()
 
 
@@ -100,6 +101,40 @@ def _mcp_tools_from_config(root: Path) -> List[str]:
     return sorted(set(names))
 
 
+def _cli_commands_from_tree(root: Path) -> List[str]:
+    """CLI entry points a README may legitimately reference: scripts/*.py basenames and
+    pyproject [project.scripts] console-script names. Without these, verify would flag a
+    correct `python3 scripts/foo.py` reference as a hallucinated tool."""
+    names: List[str] = []
+    scripts = root / "scripts"
+    if scripts.is_dir():
+        for p in scripts.glob("*.py"):
+            if not p.name.startswith("_"):
+                names.append(p.stem)
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        text = pyproject.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"(?ms)^\[project\.scripts\]\s*(.*?)(?:^\[|\Z)", text)
+        if m:
+            for line in m.group(1).splitlines():
+                key = line.split("=", 1)[0].strip().strip('"')
+                if key and not key.startswith("#"):
+                    names.append(key)
+    return sorted(set(names))
+
+
+def _install_commands(root: Path) -> List[str]:
+    cmds: List[str] = []
+    if (root / "pyproject.toml").is_file():
+        cmds.append("pip install -e .")
+        text = (root / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+        if "[project.optional-dependencies]" in text and "dev" in text:
+            cmds.append("pip install -e '.[dev]'")
+    if (root / ".codex-plugin").is_dir():
+        cmds.append(f'codex plugin marketplace add "{root}"')
+    return cmds
+
+
 def gather_durable_facts(project_root: str | Path = ".") -> Dict[str, Any]:
     """Deterministic product facts — no git diary / recent commits."""
     root = Path(project_root).expanduser().resolve()
@@ -107,6 +142,8 @@ def gather_durable_facts(project_root: str | Path = ".") -> Dict[str, Any]:
         raise ValueError(f"project_root is not a directory: {root}")
     version = _version_from_tree(root)
     tools = _mcp_tools_from_config(root)
+    cli_commands = _cli_commands_from_tree(root)
+    install_commands = _install_commands(root)
     skills = _list_skills(root)
     has_license = (root / "LICENSE").is_file() or (root / "LICENSE.md").is_file()
     readme = root / "README.md"
@@ -120,10 +157,11 @@ def gather_durable_facts(project_root: str | Path = ".") -> Dict[str, Any]:
         "version": version or "[unknown]",
         "skills": skills,
         "mcp_tools_detected": tools,
+        "cli_commands": cli_commands,
+        "install_commands": install_commands,
         "has_license": has_license,
-        "install_hints": [
+        "install_hints": install_commands or [
             f'codex plugin marketplace add "{root}"',
-            f"codex plugin add <name>@<marketplace>",
         ],
         "readme_preview_chars": len(readme_preview),
         "forbidden_in_output": [
@@ -137,6 +175,8 @@ def gather_durable_facts(project_root: str | Path = ".") -> Dict[str, Any]:
             version=version,
             skills=skills,
             tools=tools,
+            cli_commands=cli_commands,
+            install_commands=install_commands,
             has_license=has_license,
             readme_preview=readme_preview,
         ),
@@ -150,6 +190,8 @@ def _facts_as_text(
     version: str,
     skills: List[str],
     tools: List[str],
+    cli_commands: List[str],
+    install_commands: List[str],
     has_license: bool,
     readme_preview: str,
 ) -> str:
@@ -160,12 +202,70 @@ def _facts_as_text(
         f"License file present: {has_license}",
         f"Skills: {', '.join(skills) if skills else '[none detected]'}",
         f"MCP tools detected: {', '.join(tools) if tools else '[none detected in tree]'}",
+        f"CLI commands: {', '.join(cli_commands) if cli_commands else '[none detected]'}",
+        f"Install commands: {', '.join(install_commands) if install_commands else '[none detected]'}",
         "Do not invent tools, env vars, or install commands not listed here or in source_file.",
     ]
     if readme_preview:
         lines.append("Existing README preview (may be outdated; prefer facts above):")
         lines.append(readme_preview)
     return "\n".join(lines)
+
+
+_CODE_EXTS = {".py", ".toml", ".md", ".json", ".cfg", ".ini", ".txt", ".yaml", ".yml"}
+_CODE_SKIP_PARTS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "node_modules", "dist", "build"}
+
+
+def gather_code_context(
+    project_root: str | Path = ".", *, max_files: int = 45, max_chars: int = 24000
+) -> Dict[str, Any]:
+    """Collect actual source text for LLM investigators to read and reason over.
+
+    This is the raw material multiple leaf LLMs analyze (architecture, usage, …) —
+    distinct from the deterministic durable fact pack, which stays a guardrail.
+    """
+    root = Path(project_root).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"project_root is not a directory: {root}")
+
+    def _priority(p: Path) -> tuple:
+        name = p.name.lower()
+        rank = 0 if name in {"pyproject.toml", "readme.md", "package.json"} else (
+            1 if p.suffix == ".py" else 2
+        )
+        return (rank, len(p.relative_to(root).parts), str(p))
+
+    candidates = []
+    for p in root.rglob("*"):
+        if not p.is_file() or p.suffix not in _CODE_EXTS:
+            continue
+        if any(part in _CODE_SKIP_PARTS or part.endswith(".egg-info") for part in p.relative_to(root).parts):
+            continue
+        candidates.append(p)
+    candidates.sort(key=_priority)
+
+    parts: List[str] = []
+    used_files: List[str] = []
+    total = 0
+    for p in candidates[: max_files * 2]:
+        if len(used_files) >= max_files or total >= max_chars:
+            break
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = str(p.relative_to(root))
+        budget = max(0, max_chars - total)
+        snippet = body[: min(4000, budget)]
+        if not snippet:
+            break
+        block = f"\n===== FILE: {rel} =====\n{snippet}"
+        parts.append(block)
+        used_files.append(rel)
+        total += len(block)
+
+    text = f"CODE CONTEXT for {root.name} ({len(used_files)} files, ~{total} chars):\n" + "".join(parts)
+    return {"ok": True, "root": str(root), "file_count": len(used_files), "files": used_files, "text": text}
 
 
 def run_gather(stage: Dict[str, Any], *, project_root: str = ".", args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -176,5 +276,7 @@ def run_gather(stage: Dict[str, Any], *, project_root: str = ".", args: Optional
         data = gather_git(root)
         data["text"] = json.dumps(data, ensure_ascii=False, indent=2)
         return data
+    if cap == "local_code" or stage.get("id") == "gather_code":
+        return gather_code_context(root)
     # default durable / local facts
     return gather_durable_facts(root)

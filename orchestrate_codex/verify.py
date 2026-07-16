@@ -28,19 +28,25 @@ def verify_text(
     body = text or ""
     if not body.strip():
         warnings.append("empty_output")
-    for pat in RECENCY_PATTERNS:
-        if re.search(pat, body, re.I):
-            warnings.append(f"recency_language:{pat}")
+    # Recency / session-diary tone is only forbidden in durable and transform docs;
+    # change docs (PR, release notes) are expected to describe recent work.
+    if doc_class in {"durable", "transform"}:
+        for pat in RECENCY_PATTERNS:
+            if re.search(pat, body, re.I):
+                warnings.append(f"recency_language:{pat}")
     if doc_class == "durable":
         if re.search(r"\b(git log|diff --stat|HEAD~)\b", body, re.I):
             warnings.append("git_internals_in_durable_doc")
         tools = []
+        allowed: set = set()
         if isinstance(fact_pack, dict):
             tools = list(fact_pack.get("mcp_tools_detected") or [])
+            # CLI commands / console scripts are legitimate references, not hallucinated tools.
+            allowed = set(tools) | set(fact_pack.get("cli_commands") or [])
         # flag tool-like tokens not in fact pack when pack known
         if tools:
             claimed = set(re.findall(r"\b(?:google|claude_codex|grok_codex|orchestrate)_[a-z0-9_]+\b", body))
-            unknown = sorted(t for t in claimed if t not in tools)
+            unknown = sorted(t for t in claimed if t not in allowed)
             # only warn if we found claimed tools and some unknown — allow subset
             # unknown means claimed not in detected list
             for t in unknown:
