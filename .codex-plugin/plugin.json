@@ -1,6 +1,6 @@
 {
   "name": "orchestrate-codex",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Supervised multi-step recipes that bind Claude, Grok, Antigravity, and other Codex leaf providers.",
   "author": {
     "name": "Park Chanwoo",
